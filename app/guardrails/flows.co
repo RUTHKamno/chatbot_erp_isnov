@@ -1,0 +1,130 @@
+# app/guardrails/flows.co
+
+# --- Flow 1: Toxicity Catching ---
+define flow check toxicity
+  $is_toxic = execute check_input_toxicity
+  
+  if $is_toxic
+    $detected_intent = "security_threat"
+    bot refuse toxic input
+    # stop empêche les dialog rails de s'exécuter
+    stop
+
+define bot refuse toxic input
+  "Malheureusement, je ne peux pas traiter les messages contenant des propos insultants ou agressifs. Restons courtois s'il vous plaît."
+
+# --- Flow 2: SQL Injection Catching ---
+
+define flow check sql injection
+  $is_sql_injection = execute detect_sql_injection
+  
+  if $is_sql_injection
+    $detected_intent = "security_threat"
+    bot refuse malicious query
+    stop
+
+define bot refuse malicious query
+  "Alerte de sécurité : Cette requête contient des caractères ou des structures de commande non autorisés."
+
+# --- Flow 3: PII Masking ---
+define flow mask pii data
+  # This action replaces emails/phones with [MASQUÉ] dynamically in $user_message
+  $user_message = execute anonymize_pii(text=$user_message)
+
+
+# --- 1. Gestion de la Politesse (Interception instantanée) ---
+define user express greeting
+  "bonjour"
+  "salut"
+  "coucou"
+  "hello"
+  "bonsoir"
+
+define bot express greeting
+  "Bonjour ! Je suis votre assistant ERP intelligent. Comment puis-je vous aider aujourd'hui ?"
+
+define flow greeting
+  user express greeting
+  # On force l'écriture de l'intention dans le contexte pour LangGraph
+  $detected_intent = "greeting"
+  bot express greeting
+  stop
+
+
+define user express gratitude
+  "merci"
+  "merci beaucoup"
+  "super, merci"
+
+define bot express gratitude
+  "Je vous en prie ! N'hésitez pas si vous avez d'autres questions sur l'ERP."
+
+define flow gratitude
+  user express gratitude
+  $detected_intent = "gratitude"
+  bot express gratitude
+  stop
+
+
+# --- 2. Gestion du Hors-Sujet (Recadrage) ---
+define user ask off topic
+  "quel temps fait-il"
+  "raconte-moi une blague"
+  "qui a gagné le match"
+  "recette de cuisine"
+
+define bot refuse off topic
+  "Je suis spécialisé exclusivement dans l'assistance, la gestion et la documentation de votre ERP. Je ne peux pas répondre aux questions hors de ce périmètre."
+
+define flow off topic
+  user ask off topic
+  $detected_intent = "off_topic"
+  bot refuse off topic
+  stop
+
+
+# --- 3. Flux nominal : Reformulation, Cache, puis passage de relais à LangGraph ---
+define user ask erp question
+  $optional_query
+
+define flow process erp request
+  user ask erp question
+  
+  # Si l'intention a déjà été figée par un rail d'accueil ou de sécurité, on s'arrête ici
+  if $detected_intent == "greeting" or $detected_intent == "security_threat" or $detected_intent == "gratitude" or $detected_intent == "off_topic"
+    stop
+
+  # 1. On reformule UNIQUEMENT si ce n'est pas un message de politesse simple
+  $reformulated_query = execute reformulate_query(query=$user_message)
+  
+  # 2. On interroge Redis avec la question propre et autonome
+  $cache_result = execute check_redis_cache(query=$reformulated_query)
+  
+  if $cache_result.hit == True
+    bot $cache_result.answer
+  else
+    stop
+
+
+# --- Flux pour le RAG : Phase de Récupération (Retrieval Rail) ---
+define flow check retrieval relevance
+  if $check_phase == "retrieval_only"
+    $docs_are_bad = execute action_verify_documents_relevance
+    if $docs_are_bad
+      bot refuse irrelevant context
+      stop
+
+define bot refuse irrelevant context
+  "Je ne trouve pas de documentation suffisamment pertinente dans l'ERP pour répondre précisément à votre question."
+
+
+# --- Flux pour le RAG : Phase de Sortie (Output Rail) ---
+define flow check output hallucinations
+  if $check_phase == "output_only"
+    $is_hallucination = execute action_check_facts
+    if $is_hallucination
+      bot refuse hallucinated response
+      stop
+
+define bot refuse hallucinated response
+  "Désolé, la réponse générée n'a pas pu être validée par notre système de conformité par rapport aux guides officiels."

@@ -1,0 +1,42 @@
+# --- API ---
+fastapi==0.115.12
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
+pydantic==2.10.6
+pydantic-settings==2.8.1
+python-jose[cryptography]==3.4.0
+passlib[bcrypt]==1.7.4
+httpx==0.28.1
+
+# --- LangGraph / LangChain (0.3.x stack — keep core >=0.3.47 for ollama) ---
+langgraph==0.3.34
+langchain==0.3.27
+langchain-core==0.3.81
+langchain-community==0.3.27
+langchain-ollama==0.3.10
+
+# --- Cache / Vector / DB ---
+redis==5.2.1
+lancedb==0.21.1
+pyarrow==19.0.1
+asyncpg==0.30.0
+sqlalchemy[asyncio]==2.0.39
+
+# --- Security / Guardrails ---
+# Optional / heavy — install later if needed; often conflict with langchain pins
+# guardrails-ai==0.6.4
+# nemoguardrails==0.12.0
+
+# --- Artifacts ---
+reportlab==4.3.1
+matplotlib==3.10.1
+plotly==6.0.0
+python-pptx==1.0.2
+pandas==2.2.3
+jinja2==3.1.6
+
+# --- Utils ---
+python-dotenv==1.0.1
+orjson==3.10.15
+tenacity==9.0.0
+structlog==25.1.0

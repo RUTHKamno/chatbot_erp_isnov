@@ -1,0 +1,45 @@
+# app/guardrails/config.yml
+
+# --- 1. Moteur LLM Global ---
+models:
+  - type: main
+    engine: ollama
+    model: qwen2.5:7b
+    parameters:
+      base_url: "http://localhost:11434/v1"  # API compatible OpenAI de Ollama
+      temperature: 0.0                      # Strict pour le respect des rails
+
+# --- 2. Instructions Système ---
+instructions:
+  - type: general
+    task: general
+    content: |
+      Tu es l'assistant intelligent et sécurisé d'un ERP d'entreprise (Dolibarr). 
+      Tu dois guider les utilisateurs, analyser les tickets d'erreurs et orienter les demandes analytiques.
+
+# --- 3. Déclenchement de la Chaine de Rails ---
+rails:
+  # Étape A : Filtrage et nettoyage automatique à l'entrée
+  input:
+    flows:
+      - check toxicity          # Bloque les insultes / agressions
+      - check sql injection     # Bloque les attaques cyber sur l'ERP
+      - mask pii data           # Anonymise l'email, tel, carte bancaire
+
+  # Étape B : Dialogue, Aiguillage, Mémoire & Gestion du Cache
+  dialog:
+    flows:
+      - greeting                # Détecte et répond à "Bonjour" instantanément
+      - gratitude               # Détecte et répond à "Merci" instantanément
+      - off topic               # Détecte et bloque le hors-sujet complet
+      - process erp request     # Reformulation, Anaphores et interrogation du cache Redis
+
+  # Étape C : Sécurité après le Reranking (Veto si documents insuffisants)
+  retrieval:
+    flows:
+      - check retrieval relevance
+
+  # Étape D : Sécurité après la génération (Audit anti-hallucination)
+  output:
+    flows:
+      - check output hallucinations

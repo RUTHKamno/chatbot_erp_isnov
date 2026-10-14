@@ -1,0 +1,765 @@
+------------------------- erp_guide.py----------------------------------------------------------------------------------
+import json
+from typing import Any, Dict, List
+import requests
+
+from app.config import get_settings
+from app.core.vector_store import vector_store
+from app.graph.state import SMAState
+
+import torch
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+settings = get_settings()
+
+# Score minimal (0-1) du meilleur document après reranking : en dessous, on considère
+# qu'aucune documentation ne correspond et on évite d'appeler le LLM (gain de temps + anti-hallucination).
+RERANK_MIN_SCORE = getattr(settings, "rerank_min_score", 0.15)
+OLLAMA_KEEP_ALIVE = "30m"          # garde les modèles en mémoire (évite les rechargements)
+OLLAMA_TIMEOUT = (10, 180)         # (connexion, délai max entre deux tokens en streaming)
+OLLAMA_NUM_PREDICT = 700           # plafond de tokens générés
+
+#Global initialization (run once when your server starts up, not inside the function)
+MODEL_NAME = "BAAI/bge-reranker-v2-m3"
+
+# Load the model weights and tokenizer once into memory
+# This will use ~1.5 GB of VRAM/RAM
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME)
+model.eval()  # Put the model in evaluation/inference mode
+
+# Move to GPU if available for ultra-fast <100ms execution
+if torch.cuda.is_available():
+    model = model.cuda().half()  # fp16 : libère de la VRAM pour Ollama
+
+
+def generate_embedding(text: str) -> List[float]:
+    """Génère l'embedding de la requête via Ollama (nomic-embed-text)."""
+    try:
+        response = requests.post(
+            f"{settings.ollama_base_url}/api/embeddings",
+            json={"model": settings.ollama_embed_model, "prompt": text, "keep_alive": OLLAMA_KEEP_ALIVE},
+            timeout=60,
+        )
+        if response.status_code == 200:
+            return response.json().get("embedding", [])
+    except Exception as e:
+        print(f"[ERROR] Embedding generation failed: {e}")
+    return []
+
+
+def apply_reranking(
+    query: str, docs: List[Dict[str, Any]], top_n: int = 3
+) -> List[Dict[str, Any]]:
+    print(f"APPLY RERANKING FUNCTION CALLED")
+    """
+    Reranking de précision sémantique utilisant le modèle Cross-Encoder BAAI/bge-reranker-v2-m3.
+    Remplace l'approche heuristique par une analyse token-à-token approfondie.
+    """
+    if not docs:
+        return []
+    
+    print(f"docs : {len(docs)}\n\n")
+    # 1. Extraire le texte de chaque document extrait par la base vectorielle (Top-K)
+    doc_texts = [doc.get("text", "") for doc in docs]
+
+    # 2. Préparer les paires [Requête, Document] requises par l'architecture Cross-Encoder
+    pairs = [[query, text] for text in doc_texts]
+
+    # 3. Tokeniser les données pour le modèle
+    inputs = tokenizer(
+        pairs, 
+        padding=True, 
+        truncation=True, 
+        return_tensors='pt', 
+        max_length=512
+    )
+
+    # Déplacer les inputs sur la carte graphique si elle est active
+    if torch.cuda.is_available():
+        inputs = {k: v.cuda() for k, v in inputs.items()}
+
+    # 4. Exécuter l'inférence sans calcul de gradients (économie de RAM)
+    with torch.no_grad():
+        logits = model(**inputs).logits.view(-1).float()
+        # Conversion du score brut (logits) en probabilité/pertinence propre entre 0 et 1 (sigmoïde)
+        scores = torch.sigmoid(logits).tolist()
+
+    print(f"scores : {scores}\n\n")
+
+    # 5. Injecter le véritable score de pertinence sémantique dans les métadonnées de vos documents
+    for i, doc in enumerate(docs):
+        doc["rerank_score"] = scores[i]
+
+    # 6. Trier les documents par pertinence décroissante et isoler les Top_N finaux
+    sorted_docs = sorted(
+        docs, 
+        key=lambda x: x.get("rerank_score", 0), 
+        reverse=True
+    )
+    print(f"sorted_docs : {len(sorted_docs)}\n\n")
+    
+    return sorted_docs[:top_n]
+
+def call_ollama(prompt: str) -> str:
+    """Appelle Ollama en streaming et assemble la réponse."""
+    parts: List[str] = []
+    with requests.post(
+        f"{settings.ollama_base_url}/api/generate",
+        json={
+            "model": settings.ollama_llm_model,
+            "prompt": prompt,
+            "stream": True,
+            "keep_alive": OLLAMA_KEEP_ALIVE,
+            "options": {"temperature": 0.1, "num_predict": OLLAMA_NUM_PREDICT, "num_ctx": 4096},
+        },
+        stream=True,
+        timeout=OLLAMA_TIMEOUT,
+    ) as r:
+        if r.status_code != 200:
+            raise RuntimeError(f"HTTP {r.status_code} : {r.text[:300]}")
+        for line in r.iter_lines():
+            if not line:
+                continue
+            chunk = json.loads(line)
+            if "error" in chunk:
+                raise RuntimeError(chunk["error"])
+            parts.append(chunk.get("response", ""))
+            if chunk.get("done"):
+                break
+    return "".join(parts)
+
+
+def build_expert_system_prompt(context: str, user_role: str, screen: str) -> str:
+    return f"""SYSTEM INSTRUCTIONS:
+You are the official Enterprise Resource Planning (ERP) Interactive Guide Assistant.Your primary objective is to deliver precise, accurate, and step-by-step operational guidance to ERP users. STRICT CONSTRAINTS & BEHAVIORAL RULES:
+1. TRUTHFULNESS: Base your entire answer STRICTLY and EXCLUSIVELY on the provided CONTEXT below. Do NOT assume, speculate, or extrapolate beyond this context.
+2. OUT-OF-BOUNDS / MISSING INFO: If the provided context does not contain enough details to fully answer the user's query, state clearly: "Je ne dispose pas de suffisamment d'informations dans le guide officiel pour répondre à cette demande." Do not hallucinate procedures.
+3. SECURITY & ROLE BOUNDARIES: The current user has the role of [{user_role}]. Never instruct or encourage the user to perform actions outside their authorized scope.
+4. STRUCTURE & TONE: Always structure your operational guides using clear step-by-step instructions (numbered lists), mentioning specific menu navigation, screens, and action buttons. Maintain a professional, clear, and helpful tone in French.
+5. VISUAL PROCESS WORKFLOWS: If the user's request involves a multi-step navigation path, architectural process, or system workflow (e.g., changing passwords, approval processes, document workflows), supplement your textual explanation with a clean Mermaid.js diagram (e.g., `graph TD` or `sequenceDiagram`) enclosed in a ```mermaid code block.
+Adhere to the following strict rules whenever generating or modifying Mermaid code:
+
+5.1. SYNTAX VALIDITY & CHARACTER ESCAPING:
+- Avoid syntax-breaking arrows: Never use non-standard text connectors like `-->|Text|>`. Always use the standard format: `A -->|Text| B` or `A -- Text --> B`.
+- String Quoting: To prevent rendering engines from crashing due to special characters (spaces, apostrophes, accents, parentheses, hyphens), ALWAYS wrap node text labels in double quotes inside the shape syntax. 
+  Example: Correct: `A["Gestion des Congés"]` | Incorrect: `A[Gestion des Congés]` or `A['Gestion des Congés']`.
+- Label Safety: Never use unescaped single or double quotes inside a node label. If a quote is absolutely needed, use its HTML entity (`#39;` for single quote, `#34;` for double quote).
+
+5.2. SEMANTIC SHAPE USAGE:
+Choose appropriate visual anchors/shapes based on the node's function:
+- Start/End/Terminals: Use stadium/oval shapes: `id([Text])`.
+- Process/Standard Actions: Use rectangles: `id[Text]` or rounded rectangles: `id(Text)`.
+- Decisions/Conditions: Use diamonds: `id{{Text}}`.
+- Sub-processes/Pre-defined actions: Use subroutines: `id[[Text]]`.
+- Databases/Storage: Use cylindrical shapes: `id[(Text)]`.
+
+5.3. LAYOUT & READABILITY:
+- Explicit Layouts: Always specify a clear orientation at the very top (e.g., `graph TD` for top-down or `graph LR` for left-to-right processing).
+- Clean Spacing: Use indentation (4 spaces) for nested elements or subgraphs to keep the code human-readable.
+- Concise Transition Labels: Keep the text on the connector arrows short and punchy (e.g., `-->|Click|`, `-->|Yes|`).
+
+5.4. OUTPUT FORMATTING CONSTRAINT:
+- Provide ONLY the raw Mermaid code block starting with ```mermaid and ending with ```. Do not add conversational filler before or after the code block unless explicitly asked.
+CONTEXT INFORMATION:
+{context}
+
+CURRENT CONTEXTUAL METADATA:
+- Active User Role: {user_role}
+- Current Screen Context: {screen if screen else "Not specified"}
+"""
+
+
+def guide_rag_node(state: SMAState) -> Dict[str, Any]:
+    """Nœud RAG pour le Guide ERP avec Re-ranking et Prompting Expert."""
+    print(f"GUIDE RAG NODE CALLED")
+    query = state.get("reformulated_query") or state.get("raw_query", "")
+    jwt_claims = state.get("jwt_claims", {})
+    user_role = jwt_claims.get("role", "all")
+    current_screen = state.get("current_page", "")
+
+    # 1. Vectorisation
+    query_vector = generate_embedding(query)
+    if not query_vector:
+        print(f"QUERY VECTOR NOT FOUND")
+        return {
+            "answer": "Erreur technique lors de la vectorisation de la demande.",
+            "sources": [],
+        }
+
+    # 2. Retrieval initial dans LanceDB (Top-K candidats élargi = 10)
+    raw_docs = vector_store.search_guide(
+        query_vector=query_vector,
+        user_role=user_role,
+        top_k=10,
+        similarity_threshold=0.70,
+    )
+
+    if not raw_docs:
+        print(f"RAW DOCS NOT FOUND")
+        return {
+            "retrieved_docs": [],
+            "answer": "Désolé, aucune documentation officielle disponible ne correspond à votre demande ou à vos habilitations applicatives.",
+            "sources": [],
+        }
+
+    # 3. Application du Re-ranking (Top-N final = 3 documents les plus pertinents)
+    print(f"APPLYING RERANKING")
+    reranked_docs = apply_reranking(query=query, docs=raw_docs, top_n=3)
+
+
+    best_score = reranked_docs[0].get("rerank_score", 0.0) if reranked_docs else 0.0
+    print(f"BEST RERANK SCORE : {best_score:.3f} (seuil {RERANK_MIN_SCORE})")
+
+    print(f"DOCS RERANKING AFTER MIN SCORE : {len(reranked_docs)}")
+
+    if best_score < RERANK_MIN_SCORE:
+        return {
+            "retrieved_docs": [],
+            "answer": "Désolé, aucune documentation officielle disponible ne correspond à votre demande ou à vos habilitations applicatives.",
+            "sources": [],
+        }
+
+    # 4. Assemblage du contexte et déduplication des sources/URLs
+    print(f"ASSEMBLING CONTEXT AND DEDUPLICATING SOURCES/URLS")
+    context_blocks = []
+    sources = []
+    for idx, doc in enumerate(reranked_docs, 1):
+        context_blocks.append(
+            f"[Document {idx} - Module: {doc.get('module')} | Ecran: {doc.get('ecran')}]\n{doc.get('text')}"
+        )
+        if doc.get("url") and doc.get("url") not in sources:
+            sources.append(doc.get("url"))
+
+    formatted_context = "\n\n".join(context_blocks)
+
+    # 5. Construction du Prompt System
+    system_prompt = build_expert_system_prompt(
+        context=formatted_context,
+        user_role=user_role,
+        screen=current_screen,
+    )
+
+    full_prompt = (
+        f"{system_prompt}\n\n"
+        f"USER QUESTION: {query}\n\n"
+        f"EXPERT RESPONSE (in French):"
+    )
+    feedback = state.get("evaluation_feedback") if state.get("retry_count", 0) > 0 else ""
+    if feedback:
+        full_prompt += (f"\n\nPREVIOUS ANSWER REJECTED: {feedback}\n"
+                        "Rewrite the answer using ONLY the provided context and never mention "
+                        "screens outside the user's allowed scope.")
+
+    state["system_prompt"] = system_prompt
+
+    # 6. Appel du LLM Ollama (streaming : le timeout ne s'applique qu'entre deux tokens)
+    try:
+        llm_response = call_ollama(full_prompt)
+        if not llm_response.strip():
+            llm_response = "Erreur technique : le modèle n'a renvoyé aucune réponse."
+    except Exception as e:
+        print(f"❌ [OLLAMA ERROR] {type(e).__name__}: {e}")
+        llm_response = "Erreur technique : le service de génération est momentanément indisponible. Veuillez réessayer."
+
+    return {
+        "retrieved_docs": reranked_docs,
+        "answer": llm_response,
+        "sources": sources,
+        "system_prompt": system_prompt,
+    }
+
+--------------------- inspectlancedb all tables -----------------------------
+import lancedb
+from pathlib import Path
+import sys
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from app.config import get_settings
+
+settings = get_settings()
+
+def inspect_database():
+    """Lit et affiche les documents enregistrés dans LanceDB."""
+    print(f"🔍 Connexion à la base LanceDB : {settings.lancedb_uri}")
+    
+    # 1. Connexion au stockage local LanceDB
+    db = lancedb.connect(settings.lancedb_uri)
+    
+    # Vérification de l'existence des tables
+    table_names = db.table_names()
+    print(f"📋 Tables disponibles ({len(table_names)}) : {table_names}")
+    
+    table_name = settings.lancedb_table
+    if table_name not in table_names:
+        print(f"⚠️️ La table '{table_name}' n'existe pas encore dans LanceDB.")
+        return
+
+    # 2. Ouverture de la table du guide ERP
+    table = db.open_table(table_name)
+    total_records = len(table)
+    print(f"📊 Nombre total d'enregistrements/chunks : {total_records}\n")
+
+    if total_records == 0:
+        print("La table est vide.")
+        return
+
+    # 3. Conversion en DataFrame pandas pour la lecture
+    df = table.to_pandas()
+
+    print("--- 📄 APERÇU DES CHUNKS ENREGISTRÉS ---")
+    for idx, row in df.iterrows():
+        print(f"\n[Chunk {idx + 1}]")
+        print(f"  • ID               : {row.get('id', 'N/A')}")
+        print(f"  • Module           : {row.get('module', 'N/A')}")
+        print(f"  • Écran            : {row.get('ecran', 'N/A')}")
+        print(f"  • Rôle Autorisé    : {row.get('role_autorise', 'N/A')}")
+        print(f"  • Extrait du Texte : {row.get('text', '')[:120]}...")
+        if 'vector' in row:
+            print(f"  • Dim. Vectorielle : {len(row['vector'])} dimensions")
+
+if __name__ == "__main__":
+    inspect_database()
+
+-------------------------------- upload test-jalon1-------------------------------
+
+@router.post(
+    "/test-jalon1",
+    summary="[Jalon 1] Tester la conversion et le reformatage IA par blocs/streaming",
+    description="Permet d'uploader n'importe quel fichier en précisant l'identifiant du tenant (entreprise).",
+)
+async def test_jalon1_endpoint(
+    file: UploadFile = File(..., description="Fichier à tester (PDF, PPTX, CSV, TXT)"),
+    tenant_id: str = Form(
+        "ruthystore", description="Identifiant du tenant / entreprise"
+    ),
+    pages_per_chunk: int = Form(
+        5, description="Nombre de pages/diapos par bloc pour l'analyse IA"
+    ),
+    ingest: bool = Form(
+        True, description="Indexer automatiquement dans LanceDB (table erp_enterprises)"
+    ),
+):
+    from app.ingestion.pipeline import normalize_tenant_id
+
+    tenant_id = normalize_tenant_id(tenant_id)
+    cfg = get_cfg()
+    tmp_dir = cfg.data_dir / "tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    tmp_path = tmp_dir / f"test_{file.filename}"
+
+    try:
+        logger.info(
+            f"==> Début du test Jalon 1 pour le fichier: {file.filename} (Tenant: {tenant_id})"
+        )
+
+        with open(tmp_path, "wb") as buffer:
+            content = await file.read()
+            buffer.write(content)
+
+        formatted_chunks = []
+        chunk_index = 1
+
+        for formatted_block in convert_and_reformat_document(
+            file_path=tmp_path,
+            filename=file.filename or "document",
+            tenant_id=tenant_id,
+            pages_per_chunk=pages_per_chunk,
+        ):
+            formatted_chunks.append(
+                {"chunk_id": chunk_index, "formatted_text": formatted_block}
+            )
+            chunk_index += 1
+
+        ingestion_result = None
+        if ingest and formatted_chunks:
+            service = get_service()
+            ingestion_result = await run_in_threadpool(
+                service.ingest_formatted_texts,
+                texts=[c["formatted_text"] for c in formatted_chunks],
+                filename=file.filename or "document",
+                tenant_id=tenant_id,
+            )
+
+        return {
+            "status": "success",
+            "filename": file.filename,
+            "tenant_id": tenant_id,
+            "total_chunks_processed": len(formatted_chunks),
+            "chunks": formatted_chunks,
+            "ingestion": ingestion_result,
+        }
+
+    except UnsupportedFile as e:
+        error_msg = f"Type de fichier non supporté ou invalide : {str(e)}"
+        logger.error(f"[Jalon 1 Error] - UnsupportedFile: {error_msg}")
+        return JSONResponse(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            content={
+                "status": "error",
+                "error_type": "UnsupportedFileType",
+                "message": error_msg,
+                "suggestion": "Vérifiez que le fichier correspond à un format accepté (PDF, PPTX, CSV, TXT).",
+            },
+        )
+
+    except ValueError as e:
+        error_msg = f"Erreur de validation ou sécurité : {str(e)}"
+        logger.error(f"[Jalon 1 Error] - Security/Validation: {error_msg}")
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={
+                "status": "error",
+                "error_type": "ValidationError",
+                "message": error_msg,
+            },
+        )
+
+    except Exception as e:
+        stack_trace = traceback.format_exc()
+        logger.error(f"[Jalon 1 Error] - Erreur inattendue : {str(e)}\n{stack_trace}")
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={
+                "status": "error",
+                "error_type": e.__class__.__name__,
+                "message": f"Erreur lors du traitement LLM/Fichier : {str(e)}",
+                "details": {"traceback": stack_trace.splitlines()[-5:]},
+                "suggestion": "Assurez-vous qu'Ollama est bien lancé.",
+            },
+        )
+
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
+
+
+---------------------------- jalon_tes, discover url, etc---------------------------
+
+@router.post(
+    "/test-jalon1-url",
+    summary="[Jalon 1] Scrapper et ingérer une documentation web via Crawl4AI",
+)
+async def test_jalon1_url_endpoint(
+    url: str = Form(
+        "https://books.toscrape.com/", description="URL de la documentation web"
+    ),
+    tenant_id: str = Form("dolibarr", description="Identifiant du tenant / entreprise"),
+    max_pages: int = Form(5, description="Nombre max de pages à crawler"),
+    ingest: bool = Form(True, description="Indexer automatiquement dans LanceDB"),
+):
+    tenant_id = normalize_tenant_id(tenant_id)
+    cfg = get_cfg()
+    tmp_dir = cfg.data_dir / "tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    safe_name = re.sub(r"[^\w\-]", "_", url.split("//")[-1])[:50]
+    tmp_txt_path = tmp_dir / f"web_{safe_name}.txt"
+
+    try:
+        # 1. Scraping haute performance via Crawl4AI
+        await run_in_threadpool(
+            run_crawl4ai_sync,
+            start_url=url,
+            output_txt_path=tmp_txt_path,
+            max_pages=max_pages,
+        )
+
+        # 2. Passage au convertisseur extensible
+        # formatted_chunks = []
+        chunk_index = 1
+
+        """
+        for formatted_block in convert_and_reformat_document(
+            file_path=tmp_txt_path,
+            filename=f"web_{safe_name}.txt",
+            tenant_id=tenant_id,
+            pages_per_chunk=1,
+        ):
+            formatted_chunks.append(
+                {"chunk_id": chunk_index, "formatted_text": formatted_block}
+            )
+            chunk_index += 1
+
+        # 3. Ingestion automatique dans LanceDB (RAG + Matrice RBAC)
+        ingestion_result = None
+        if ingest and formatted_chunks:
+            service = get_default_service()
+            ingestion_result = await run_in_threadpool(
+                service.ingest_formatted_texts,
+                texts=[c["formatted_text"] for c in formatted_chunks],
+                filename=f"URL_{safe_name}",
+                tenant_id=tenant_id,
+            )
+        """
+
+        # lecture du fichier temporaire
+        formatted_chunks = []
+        with open(tmp_txt_path, "r", encoding="utf-8", errors="ignore") as f:
+            content = f.read().strip()
+            if content:
+                formatted_chunks.append({"chunk_id": 1, "formatted_text": content})
+            else:
+                raise HTTPException(
+                    400, "Le scraping a échoué ou le contenu est vide après extraction."
+                )
+
+        return {
+            "status": "success",
+            "source_url": url,
+            "tenant_id": tenant_id,
+            # "total_chunks_processed": len(formatted_chunks),
+            "chunks": formatted_chunks,
+            # "ingestion": ingestion_result,
+        }
+
+    except ScrapingBlockedException as e:
+        formatted_html_message = (
+            f'<i style="color:red;">Le lien fourni ({url}) présente des restrictions de sécurité '
+            f"ou nécessite des applets/authentifications supérieures ({e.reason}), ce qui rend le scraping automatique impossible. "
+            "Veuillez plutôt fournir la documentation sous forme de fichier structuré (PDF, TXT, CSV).</i>"
+        )
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            content={
+                "status": "scraping_blocked",
+                "error_type": "ScrapingBlockedException",
+                "reason": e.reason,
+                "display_message_html": formatted_html_message,
+            },
+        )
+    finally:
+        if tmp_txt_path.exists():
+            tmp_txt_path.unlink(missing_ok=True)
+
+
+@router.post(
+    "/discover-url",
+    summary="[Phase 1] Inspecter une URL et lister les liens disponibles",
+    description="Scrappe la page initiale et retourne son contenu ainsi que la liste des liens détectés sous forme d'options.",
+)
+async def discover_url_endpoint(
+    url: str = Form(
+        "https://www.dolibarr.org/documentation-home.php",
+        description="URL initiale à inspecter",
+    ),
+):
+    cfg = get_cfg()
+    tmp_dir = cfg.data_dir / "tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    safe_name = re.sub(r"[^\w\-]", "_", url.split("//")[-1])[:50]
+    tmp_txt_path = tmp_dir / f"discover_{safe_name}.txt"
+
+    try:
+        # Scraping de la page racine
+        await run_in_threadpool(
+            run_crawl4ai_sync,
+            start_url=url,
+            output_txt_path=tmp_txt_path,
+            max_pages=1,
+        )
+
+        with open(tmp_txt_path, "r", encoding="utf-8") as f:
+            scraped_content = f.read()
+
+        # Extraction dynamique des liens sous forme d'options pour le select multiple
+        extracted_links = extract_markdown_links(scraped_content, url)
+
+        return {
+            "status": "success",
+            "source_url": url,
+            "discovered_links": extracted_links,
+            "scraped_content": scraped_content,
+        }
+
+    except ScrapingBlockedException as e:
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            content={
+                "status": "scraping_blocked",
+                "display_message_html": f'<i style="color:red;">Le lien ({url}) ne peut pas être scrappé automatiquement : {e.reason}.</i>',
+                "discovered_links": [],
+            },
+        )
+
+    except ScrapingBlockedException as e:
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            content={
+                "status": "scraping_blocked",
+                "display_message_html": f'<i style="color:red;">Le lien ({url}) ne peut pas être scrappé automatiquement : {e.reason}.</i>',
+                "discovered_links": [],
+            },
+        )
+    finally:
+        if tmp_txt_path.exists():
+            tmp_txt_path.unlink(missing_ok=True)
+
+
+class URLIngestSelectionRequest(BaseModel):
+    start_url: str = Field(..., description="URL de départ")
+    tenant_id: str = Field("dolibarr", description="Identifiant de l'entreprise")
+    selected_urls: List[str] = Field(
+        default_factory=list,
+        description="Liste des URLs sélectionnées par l'utilisateur",
+    )
+    ingest: bool = Field(True, description="Indexer directement dans LanceDB")
+
+
+@router.post(
+    "/process-url-selection",
+    summary="[Phase 2] Fusionner et ingérer les URLs sélectionnées dans LanceDB",
+    description="Scrappe les URLs choisies par l'utilisateur, réunit tout le texte et procède à l'ingestion RAG/RBAC.",
+)
+async def process_url_selection_endpoint(payload: URLIngestSelectionRequest):
+    tenant_id = normalize_tenant_id(payload.tenant_id)
+    cfg = get_cfg()
+    tmp_dir = cfg.data_dir / "tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    safe_name = re.sub(r"[^\w\-]", "_", payload.start_url.split("//")[-1])[:50]
+    merged_file_path = tmp_dir / f"merged_{safe_name}.txt"
+
+    try:
+        # 1. Scraping combiné de la page racine + des URLs cochées
+        merged_text = await run_in_threadpool(
+            crawl_multiple_selected_urls_sync,
+            start_url=payload.start_url,
+            selected_urls=payload.selected_urls,
+        )
+
+        with open(merged_file_path, "w", encoding="utf-8") as f:
+            f.write(merged_text)
+
+        # 2. Passage au convertisseur extensible
+        formatted_chunks = []
+        chunk_index = 1
+
+        for formatted_block in convert_and_reformat_document(
+            file_path=merged_file_path,
+            filename=f"URL_{safe_name}.txt",
+            tenant_id=tenant_id,
+            pages_per_chunk=1,
+        ):
+            formatted_chunks.append(
+                {"chunk_id": chunk_index, "formatted_text": formatted_block}
+            )
+            chunk_index += 1
+        """
+        # 3. Ingestion dans LanceDB (Chunks RAG + Matrice RBAC)
+        ingestion_result = None
+        if payload.ingest and formatted_chunks:
+            service = get_default_service()
+            ingestion_result = await run_in_threadpool(
+                service.ingest_formatted_texts,
+                texts=[c["formatted_text"] for c in formatted_chunks],
+                filename=f"URL_{safe_name}",
+                tenant_id=tenant_id,
+            )
+        """
+        return {
+            "status": "success",
+            "tenant_id": tenant_id,
+            "total_pages_scraped": len(payload.selected_urls) + 1,
+            "total_chunks_processed": len(formatted_chunks),
+            "chunks": formatted_chunks,
+            # "ingestion": ingestion_result,
+        }
+
+    except Exception as e:
+        stack_trace = traceback.format_exc()
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={
+                "status": "error",
+                "message": f"Erreur lors de la fusion/ingestion des URLs : {str(e)}",
+                "details": {"traceback": stack_trace.splitlines()[-5:]},
+            },
+        )
+    finally:
+        if merged_file_path.exists():
+            merged_file_path.unlink(missing_ok=True)
+
+------------- workflow.py acien ----------------
+from typing import Dict, Any, Literal
+from langgraph.graph import StateGraph, END
+
+# Import de l'État centralisé
+from app.graph.state import SMAState, Intent
+
+# Import des nœuds agents
+from app.agents.erp_guide import guide_rag_node
+from app.agents.evaluator import evaluator_judge_node
+
+
+# --- 1. Définition du nœud initial (Orchestrateur) ---
+def orchestrator_node(state: SMAState) -> Dict[str, Any]:
+    """
+    Nœud initial Orchestrateur :
+    Récupère la requête, initialise les intentions et oriente l'exécution vers les agents spécialisés.
+    """
+    query = state.get("raw_query", "")
+    
+    # Mise à jour initiale de l'état
+    return {
+        "intent": Intent.UNKNOWN.value,
+        "route": "guide_rag"
+    }
+
+
+# --- 2. Condition de routage de la boucle de rétroaction (Guardrails / RBAC) ---
+def should_continue(state: SMAState) -> Literal["guide_rag", "__end__"]:
+    """
+    Logique de routage de la boucle de rétroaction :
+    - Si la réponse passe l'évaluation Guardrails, le workflow se termine.
+    - Si l'évaluation échoue mais qu'il reste des essais (retry_count < 3),
+      le graphe réoriente vers 'guide_rag' pour régénération avec le feedback.
+    - Si le nombre maximal de tentatives (3) est atteint, le flux prend fin (message de blocage).
+    """
+    passed = state.get("evaluation_passed", False)
+    retries = state.get("retry_count", 0)
+
+    if passed:
+        return END
+
+    if retries < 3:
+        # Boucle de rétroaction : retour au RAG avec le message d'erreur/feedback
+        return "guide_rag"
+
+    # Stopper après 3 échecs consécutifs
+    return END
+
+
+# --- 3. Construction et Assemblage du Graphe ---
+workflow = StateGraph(SMAState)
+
+# Ajout des nœuds
+workflow.add_node("orchestrator", orchestrator_node)
+workflow.add_node("guide_rag", guide_rag_node)
+workflow.add_node("evaluator", evaluator_judge_node)
+
+# Définition du point d'entrée sur l'orchestrateur
+workflow.set_entry_point("orchestrator")
+
+# Transition initiale de l'Orchestrateur vers le nœud Guide RAG
+workflow.add_edge("orchestrator", "guide_rag")
+
+# Transition directe du Guide RAG vers l'Évaluateur pour contrôle de sécurité
+workflow.add_edge("guide_rag", "evaluator")
+
+# Arête conditionnelle depuis l'évaluateur (Validation vs Boucle <= 3)
+workflow.add_conditional_edges(
+    "evaluator",
+    should_continue,
+    {
+        "guide_rag": "guide_rag",
+        END: END
+    }
+)
+
+# --- 4. Compilation du Graphe ---
+sma_graph = workflow.compile()
