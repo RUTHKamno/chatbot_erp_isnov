@@ -1,0 +1,2 @@
+tenant_id,module,roles,ecran,instructions,url
+entreprise_acme,Comptabilité,"admin, comptable",Validation des Factures,Procédure de validation des factures reçues.,https://app.acme.com/factures
