@@ -1,0 +1,56 @@
+# --- Framework Core & Serveur ---
+fastapi>=0.115.0,<0.116.0
+starlette>=0.40.0
+uvicorn[standard]>=0.34.0
+httpx==0.28.1
+python-dotenv==1.2.4
+
+# --- Interface & Visualisation ---
+streamlit==1.60.0
+streamlit_mermaid==0.3.0
+altair==4.2.2
+vega_datasets==0.9.0
+matplotlib==3.11.2
+plotly
+
+# --- Stack Agentic IA & LLM ---
+crawl4ai==0.9.4
+langchain_text_splitters>=0.2.0
+langgraph==1.2.16
+nemoguardrails==0.24.1
+ollama==0.6.3
+openai==3.37.0
+huggingface_hub==1.33.0
+
+# --- Modèles d'exécution Lourds (Audio/Vision/IA) ---
+torch>=2.1.0,<2.5.0
+transformers>=4.40.0
+ctranslate2==4.8.3
+faster_whisper==1.2.1
+kokoro==0.9.4
+
+# --- Base de données, Vecteurs & Cache ---
+lancedb>=0.15.0
+pyarrow==19.0.1
+pydantic>=2.10.0,<2.15.0
+redis==5.2.1
+SQLAlchemy>=2.0.0
+psycopg2-binary>=2.9.9,<3
+
+# --- Traitement de Documents & Audio ---
+pdfplumber==0.11.10
+Pillow==12.3.0
+pytesseract==0.3.13
+pydub==0.25.1
+soundfile==0.14.0
+reportlab==4.3.1
+python-pptx
+
+# --- Sécurité & Utilitaires ---
+cryptography==50.0.2
+PyJWT==2.15.1
+beautifulsoup4==4.15.0
+Requests==2.34.2
+pytest==9.1.1
+yfinance==1.7.0
+playwright==1.63.0

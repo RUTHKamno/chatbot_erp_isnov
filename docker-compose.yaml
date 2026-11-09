@@ -1,0 +1,161 @@
+services:
+  # ---------------------------------------------------------------------------
+  # SMA API — Système Multi-Agents (FastAPI + LangGraph)
+  # ---------------------------------------------------------------------------
+  sma-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: erp_chatbot_sma_api
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "8001:8000"
+    environment:
+      - CUBE_API_URL=http://cube_semantic_layer:4000
+      - CUBE_API_SECRET=3dfea42a566996f37c5fdbe97f14749086a40e59fcd03f96a688782828bd5128
+      - REDIS_HOST=redis
+    volumes:
+      - .:/app
+      - artifacts_data:/data/artifacts
+      - lancedb_data:/data/lancedb
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+      cube:
+        condition: service_started
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - sma_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
+
+  # ---------------------------------------------------------------------------
+  # Redis — cache sémantique + sessions
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7.4-alpine
+    container_name: erp_chatbot_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - sma_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  # ---------------------------------------------------------------------------
+  # PostgreSQL — DWH / transactions
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16.8-alpine
+    container_name: erp_chatbot_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: erp_user
+      POSTGRES_PASSWORD: erp_secure_password
+      POSTGRES_DB: erp_dwh
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - sma_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U erp_user -d erp_dwh"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # pgAdmin
+  # ---------------------------------------------------------------------------
+  pgadmin:
+    image: dpage/pgadmin4:9.1
+    container_name: erp_chatbot_pgadmin
+    restart: unless-stopped
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@admin.com
+      PGADMIN_DEFAULT_PASSWORD: admin_password
+      PGADMIN_LISTEN_PORT: 80
+    ports:
+      - "5050:80"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+    networks:
+      - sma_network
+
+  # ---------------------------------------------------------------------------
+  # Ollama — LLM / embeddings / Llama Guard
+  # ---------------------------------------------------------------------------
+  ollama:
+    image: ollama/ollama:0.35.0
+    container_name: erp_chatbot_ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    networks:
+      - sma_network
+    # GPU (NVIDIA) : décommentez si le runtime nvidia est disponible
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+    
+  # ---------------------------------------------------------------------------
+  # Cube — Couche Sémantique Multi-Tenant (Remplace WrenAI)
+  # ---------------------------------------------------------------------------
+  cube:
+    image: cubejs/cube:v0.36.0
+    container_name: cube_semantic_layer
+    restart: unless-stopped
+    ports:
+      - "4000:4000"
+      - "4001:4001"
+    environment:
+      - CUBEJS_API_SECRET=3dfea42a566996f37c5fdbe97f14749086a40e59fcd03f96a688782828bd5128 # Même clé que sma-api
+      - CUBEJS_DEV_MODE=true # Permet d'accéder à la console de dev en local
+    volumes:
+      - ./app/core:/cube/conf
+    networks:
+      - sma_network
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+
+networks:
+  sma_network:
+    driver: bridge
+
+volumes:
+  redis_data:
+  postgres_data:
+  pgadmin_data:
+  ollama_data:
+  lancedb_data:
+  artifacts_data:

@@ -1,0 +1,145 @@
+# =====================================================================
+# 🛡️ INPUT RAILS : FILTRAGE DES REQUÊTES ENTRANTES
+# =====================================================================
+
+# ---------------------- détecte les cas limites et les cas de duplication de textes dans un meme message ---------------------
+
+define flow check limits and repetitions
+  $limit_check = execute sanitize_and_check_limits
+  
+  # On met immédiatement à jour le message utilisateur s'il a été condensé
+  $user_message = $limit_check.user_message
+
+  if $limit_check.matched == True
+    $detected_intent = "limit_case"
+    bot $limit_check.reply
+    stop
+
+
+define flow fast small talk
+  $fast = execute action_fast_small_talk
+
+  if $fast.matched == True
+    $detected_intent = "greeting"
+    bot $fast.reply
+    stop
+
+
+# --- 1. Détection Jailbreak (DAN, Injonctions contradictoires) ---
+define flow check jailbreak attempts
+  $jailbreak_status = execute action_verify_jailbreak
+
+  if $jailbreak_status == "jailbreak"
+    $detected_intent = "security_threat"
+    bot refuse jailbreak attempt
+    stop
+
+define bot refuse jailbreak attempt
+  "Alerte de sécurité : Tentative de manipulation du modèle ou de contournement des règles détectée. Requête bloquée."
+
+
+# --- 2. Détection Toxicité (Insultes, Grossièretés) ---
+define flow check toxicity
+  $is_toxic = execute check_input_toxicity
+  
+  if $is_toxic
+    $detected_intent = "security_threat"
+    # La valeur retournée par l'action est stockée dans le contexte du flow.
+    $detected_intent = execute block_graph_of_toxic
+
+    bot refuse toxic input
+    stop
+
+define bot refuse toxic input
+  "Malheureusement, je ne peux pas traiter les messages contenant des propos insultants ou agressifs. Restons courtois s'il vous plaît."
+
+
+
+# --- 3. Détection Injection SQL ---
+define flow check sql injection
+  $is_sql_injection = execute detect_sql_injection
+  
+  if $is_sql_injection
+    $detected_intent = "security_threat"
+    bot refuse malicious query
+    stop
+
+define bot refuse malicious query
+  "Alerte de sécurité : Cette requête contient des structures de commande non autorisées."
+
+
+# --- 4. Détection Hors-Sujet & Politesse (Topic Control) ---
+define flow topic safety check
+
+  $topic_data = execute action_verify_topic
+
+  if $topic_data.status == "forbidden_off_topic"
+    $detected_intent = "off_topic"
+    bot $topic_data.reply
+    stop
+
+  if $topic_data.status == "allowed_small_talk"
+    $detected_intent = "greeting"
+    bot $topic_data.reply
+    stop
+
+define bot refuse off topic
+  "Je suis spécialisé exclusivement dans l'assistance, la gestion et la documentation de votre ERP. Je ne peux pas répondre aux sujets hors de ce périmètre."
+
+define bot express greeting
+  "Bonjour ! Je suis votre assistant ERP intelligent. Comment puis-je vous aider aujourd'hui ?"
+
+
+# --- 5. Anonymisation PII ---
+define flow mask pii data
+  $result = execute anonymize_pii
+  $user_message = $result.cleaned_text
+
+
+# =====================================================================
+# 🧭 FLUX NOMINAL : SI TOUT EST OK -> PASSAGE AU REFORMULATEUR RAG
+# =====================================================================
+define flow process erp request
+  $reformulation = execute reformulate_query(query=$user_message)
+  $reformulated_query = $reformulation.reformulated_query
+  $detected_intent = $reformulation.intent
+  $cache_result = execute check_redis_cache(query=$reformulated_query)
+  if $cache_result.hit == True
+    bot $cache_result.answer
+    stop
+
+
+# --- Contrôle des documents récupérés avant la génération ---
+define flow check retrieval relevance
+  if $check_phase == "retrieval_only"
+    $docs_are_bad = execute action_verify_documents_relevance
+    if $docs_are_bad
+      bot refuse irrelevant context
+      stop
+
+define bot refuse irrelevant context
+  "Je ne trouve pas de documentation suffisamment pertinente pour répondre précisément à votre question."
+
+
+# --- Contrôle de la réponse après génération ---
+define flow check output hallucinations
+  if $check_phase == "output_only"
+    $is_hallucination = execute action_check_facts
+    if $is_hallucination
+      bot refuse hallucinated response
+      stop
+
+define bot refuse hallucinated response
+  "Désolé, la réponse générée n'a pas pu être validée par rapport aux guides officiels."
+
+# --------- pour les tentaives de détecter (comment braquer une banque etc) -------------------------
+define flow check illegal attempts
+  $is_illegal = execute check_illegal_activity
+  
+  if $is_illegal
+    $detected_intent = "security_threat"
+    bot refuse illegal activity
+    stop
+
+define bot refuse illegal activity
+  "Je ne peux pas vous assister dans des démarches visant à falsifier des documents, détourner des fonds ou contourner les contrôles de conformité du système."

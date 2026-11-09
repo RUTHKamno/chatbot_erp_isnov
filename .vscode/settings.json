@@ -1,0 +1,6 @@
+{
+    "python.analysis.extraPaths": [
+        "./app/ingestion/loaders"
+    ],
+    "python.terminal.useEnvFile": true
+}
