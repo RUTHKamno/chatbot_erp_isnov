@@ -1,0 +1,13 @@
+Metadata-Version: 2.4
+Name: dashboard_generator
+Version: 0.1.0
+Summary: Générateur dynamique de dashboards Streamlit propulsé par LanceDB et LLM
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: streamlit>=1.32.0
+Requires-Dist: lancedb>=0.6.0
+Requires-Dist: sentence-transformers>=2.5.0
+Requires-Dist: pydantic>=2.0.0
+Requires-Dist: pypdf>=4.0.0
+Requires-Dist: pandas>=2.0.0
+Requires-Dist: openai>=1.0.0

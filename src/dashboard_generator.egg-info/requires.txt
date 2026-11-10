@@ -1,0 +1,7 @@
+streamlit>=1.32.0
+lancedb>=0.6.0
+sentence-transformers>=2.5.0
+pydantic>=2.0.0
+pypdf>=4.0.0
+pandas>=2.0.0
+openai>=1.0.0

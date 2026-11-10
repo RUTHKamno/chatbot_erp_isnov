@@ -1,0 +1,139 @@
+import json
+import re
+from openai import OpenAI
+from config import LLM_MODEL_NAME, OLLAMA_BASE_URL, SEMANTIC_CURATED_DIR
+import yaml
+import unicodedata
+import requests
+
+def extract_allowed_members() -> dict:
+    """Extraie la liste fermée des mesures et dimensions autorisées depuis les YAML curés."""
+    members = {"measures": [], "dimensions": [], "time_dimensions": []}
+    if not SEMANTIC_CURATED_DIR.exists():
+        print(f"❌ [DEBUG] Le dossier sémantique curé n'existe pas : {SEMANTIC_CURATED_DIR}")
+        return members
+
+    import yaml
+    files = list(SEMANTIC_CURATED_DIR.glob("**/*.yml"))
+    print(f"📁 [DEBUG] {len(files)} fichier(s) YAML trouvé(s) pour l'extraction des membres.")
+
+    for file_path in files:
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+                cubes = data.get("cubes", [])
+                for cube in cubes:
+                    c_name = cube.get("name", "")
+                    for m in cube.get("measures", []):
+                        m_name = m.get('name')
+                        if m_name:
+                            members["measures"].append(f"{c_name}.{m_name}")
+                    for d in cube.get("dimensions", []):
+                        d_name = d.get("name")
+                        if not d_name:
+                            continue
+                        d_type = d.get("type", "").lower()
+                        if d_type == "time" or "date" in d_name.lower():
+                            members["time_dimensions"].append(f"{c_name}.{d_name}")
+                        else:
+                            members["dimensions"].append(f"{c_name}.{d_name}")
+        except Exception as e:
+            print(f"⚠️ [DEBUG] Erreur de lecture sur {file_path.name} : {e}")
+            continue
+
+    print(f"✅ [DEBUG] Membres extraits -> Mesures: {len(members['measures'])}, Dimensions: {len(members['dimensions'])}, Temps: {len(members['time_dimensions'])}")
+    return members
+
+def generate_cube_queries_for_dashboard(dashboard_json: dict) -> list[dict]:
+    """
+    Génère un tableau de requêtes Cube.js (une pour CHAQUE composant du JSON LanceDB)
+    avec validation stricte des membres via qwen2.5-coder:7b et logs complets.
+    """
+    print("\n--- [CUBE QUERY GENERATOR] Début de la génération ---")
+    
+    components = dashboard_json.get("components", [])
+    if not components:
+        print("⚠️ [AVERTISSEMENT] Aucun composant trouvé dans le JSON du dashboard.")
+        return []
+
+    print(f"📊 [DEBUG] Nombre de composants à traduire : {len(components)}")
+
+    members = extract_allowed_members()
+    if not members["measures"]:
+        print("❌ [ERREUR CRITIQUE] Aucune mesure n'a pu être extraite des YAML. Vérifie le contenu de ton dossier curé !")
+    
+    system_prompt = f"""You are a translation engine: "dashboard component -> Cube.js REST API query".
+You are NOT a conversational assistant. Your output is parsed by a program.
+
+## ALLOWED MEMBERS (STRICT LIST - USE ONLY THESE)
+### Measures:
+{json.dumps(members['measures'], indent=2)}
+
+### Dimensions:
+{json.dumps(members['dimensions'], indent=2)}
+
+### Time Dimensions:
+{json.dumps(members['time_dimensions'], indent=2)}
+
+## OUTPUT FORMAT
+Return a SINGLE JSON object containing an array "queries" with one Cube query per component:
+{{
+  "queries": [
+    {{
+      "component_title": "Titre exact du composant",
+      "cube_query": {{
+        "measures": ["cube_name.measure_name"],
+        "dimensions": ["cube_name.dimension_name"],
+        "timeDimensions": [
+          {{
+            "dimension": "cube_name.time_dimension",
+            "dateRange": "last month",
+            "granularity": "month"
+          }}
+        ]
+      }}
+    }}
+  ]
+}}
+
+## STRICT RULES
+1. NEVER invent member names. Copy them EXACTLY from the ALLOWED MEMBERS list above.
+2. If a component asks for totals/sums without grouping, do not include "dimensions".
+3. Use "last month", "this year", "last year" for dateRange in timeDimensions.
+4. Output strictly valid JSON without markdown code blocks.
+"""
+
+    user_prompt = f"Traduire les composants suivants en requêtes Cube.js :\n{json.dumps(components, indent=2, ensure_ascii=False)}"
+
+    client = OpenAI(api_key="ollama", base_url=OLLAMA_BASE_URL)
+    coder_model = "qwen2.5-coder:7b"
+
+    print(f"🤖 [INFO] Envoi de la requête au LLM ({coder_model})...")
+
+    try:
+        response = client.chat.completions.create(
+            model=coder_model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.0
+        )
+
+        raw_content = response.choices[0].message.content
+        print(f"📥 [DEBUG] Réponse brute reçue de {coder_model} :\n{raw_content}\n----------------------------------")
+
+        result = json.loads(raw_content)
+        queries_list = result.get("queries", [])
+        print(f"✅ [SUCCÈS] {len(queries_list)} requête(s) Cube générée(s) avec succès.")
+        print("--- [CUBE QUERY GENERATOR] Fin du traitement ---\n")
+        return queries_list
+
+    except json.JSONDecodeError as je:
+        print(f"❌ [ERREUR JSON] Le LLM n'a pas renvoyé un JSON valide : {je}")
+        return []
+    except Exception as e:
+        print(f"❌ [ERREUR] Échec de la génération des requêtes : {e}")
+        return []
+    

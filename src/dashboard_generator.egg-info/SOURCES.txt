@@ -1,0 +1,14 @@
+README.md
+pyproject.toml
+src/__init__.py
+src/app.py
+src/config.py
+src/ingest_data_to_lancedb.py
+src/json_generator.py
+src/nlp_processor.py
+src/vector_retriever.py
+src/dashboard_generator.egg-info/PKG-INFO
+src/dashboard_generator.egg-info/SOURCES.txt
+src/dashboard_generator.egg-info/dependency_links.txt
+src/dashboard_generator.egg-info/requires.txt
+src/dashboard_generator.egg-info/top_level.txt

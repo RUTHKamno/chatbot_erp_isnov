@@ -1,0 +1,15 @@
+[project]
+name = "dashboard_generator"
+version = "0.1.0"
+description = "Générateur dynamique de dashboards Streamlit propulsé par LanceDB et LLM"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "streamlit>=1.32.0",
+    "lancedb>=0.6.0",
+    "sentence-transformers>=2.5.0",
+    "pydantic>=2.0.0",
+    "pypdf>=4.0.0",
+    "pandas>=2.0.0",
+    "openai>=1.0.0"  # ou ollama / groq selon ton choix de LLM local/API
+]
